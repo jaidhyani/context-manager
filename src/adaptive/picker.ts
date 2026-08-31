@@ -26,7 +26,7 @@ import type {
   ProduceRequest,
 } from './folding-strategy.js';
 import type { SummaryEntry } from '../types/strategy.js';
-import { getSummaryParentId } from '../types/strategy.js';
+import { getSummaryParentId, topmostAtSameLevel } from '../types/strategy.js';
 
 /**
  * Error raised when the picker has folded everything it can and the
@@ -237,7 +237,12 @@ export function accountFrontier(
       if (!parentId) return null;
       current = summaries.get(parentId);
     }
-    return current && current.level === level ? current : null;
+    if (!current || current.level !== level) return null;
+    // Topmost at the level, not the first: a merge-in-place consolidation
+    // parents its sources to a broader SAME-level entry, and `renderedSummaries`
+    // dedups on the returned id — landing on a merged-away child would bill one
+    // recall pair per source instead of one for the whole consolidation.
+    return topmostAtSameLevel(current, getSummaryParentId, (id) => summaries.get(id));
   };
 
   let total = inputs.headTokens + inputs.tailTokens;

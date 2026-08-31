@@ -159,6 +159,41 @@ export class MockChronicle {
   }
 
   /**
+   * Merge-in-place: consolidate N same-level summaries into ONE broader entry
+   * at that same level, parenting each source to it. This is what a merge at
+   * `maxMergeLevel` produces — the hierarchy widens instead of deepening.
+   */
+  consolidateInPlace(level: number, sourceSummaryIds: SummaryId[]): SummaryEntry {
+    const sources = sourceSummaryIds.map((sid) => {
+      const s = this.summaries.get(sid);
+      if (!s) throw new Error(`consolidateInPlace: unknown source summary ${sid}`);
+      if (s.level !== level) {
+        throw new Error(`consolidateInPlace: source ${sid} is level ${s.level}, expected ${level}`);
+      }
+      return s;
+    });
+    const id = this.allocSummaryId(level);
+    const entry: SummaryEntry = {
+      id,
+      level,
+      content: `[mock L${level} consolidation of ${sourceSummaryIds.length} L${level}s]`,
+      tokens: this.defaultRecallPairTokens,
+      sourceLevel: level,
+      sourceIds: [...sourceSummaryIds],
+      sourceRange: {
+        first: sources[0].sourceRange.first,
+        last: sources[sources.length - 1].sourceRange.last,
+      },
+      created: Date.now(),
+    };
+    this.summaries.set(id, entry);
+    this.recallPairTokens.set(id, this.defaultRecallPairTokens);
+    for (const s of sources) s.parentId = id;
+    this.llmCalls++;
+    return entry;
+  }
+
+  /**
    * Speculative pre-producer: when N siblings exist sharing the same potential
    * parent at level k+1, eagerly produce L_{k+1}. Bottom-up, idempotent.
    * Mirrors the design's background pre-producer (§7 #2 settled decisions).

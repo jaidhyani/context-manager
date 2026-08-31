@@ -21,7 +21,7 @@
 import type { ChunkId, SummaryId } from './folding-strategy.js';
 import type { PickerInputs } from './picker.js';
 import type { SummaryEntry } from '../types/strategy.js';
-import { getSummaryParentId } from '../types/strategy.js';
+import { getSummaryParentId, topmostAtSameLevel } from '../types/strategy.js';
 
 /** A raw chunk (resolution 0) — a leaf of the summary forest. */
 export interface LeafNode {
@@ -139,6 +139,10 @@ export class SummaryTree {
   /**
    * The L_level ancestor summary of a chunk, or null if not present. Matches
    * the picker's `accountFrontier` ancestor walk (parentId chain from l1Id).
+   *
+   * Returns the TOPMOST node at `level`: a merge-in-place consolidation links
+   * its sources to a broader SAME-level entry, and that broader entry is what
+   * renders (see `topmostAtSameLevel`).
    */
   ancestorAt(chunkId: ChunkId, level: number): SummaryNode | null {
     if (level <= 0) return null;
@@ -149,7 +153,8 @@ export class SummaryTree {
       if (!cur.parentId) return null;
       cur = this.nodes.get(cur.parentId);
     }
-    return cur && cur.level === level ? cur : null;
+    if (!cur || cur.level !== level) return null;
+    return topmostAtSameLevel(cur, (n) => n.parentId, (id) => this.nodes.get(id));
   }
 
   /** Highest level k for which a summary covering this chunk exists (0 = none). */

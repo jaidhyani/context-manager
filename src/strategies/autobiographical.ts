@@ -28,7 +28,7 @@ import type {
   PreviewResult,
 } from '../types/index.js';
 import { DEFAULT_AUTOBIOGRAPHICAL_CONFIG } from '../types/index.js';
-import { getSummaryParentId } from '../types/strategy.js';
+import { getSummaryParentId, topmostAtSameLevel } from '../types/strategy.js';
 import { selectKeeperL1s } from './keeper-selection.js';
 import { splitMixedToolMessages, stripUnpairedToolBlocks } from '../normalize-tool-messages.js';
 import { MessageStore } from '../message-store.js';
@@ -3458,6 +3458,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * summaries whose source ranges fall within [firstMsgId..lastMsgId].
    * No-op if fewer than 2 viable sources are available (a singleton merge
    * would just rename a summary without consolidating).
+   *
+   * Above `maxMergeLevel` this becomes a merge-in-place at the ceiling —
+   * same-level sources, same-level target — matching what
+   * `checkMergeThresholdRecursive` does. Without the clamp a picker demand for
+   * L_{ceiling+1} would mint a level the hierarchy is not allowed to grow.
    */
   protected enqueueMergeForRange(
     targetLevel: number,
@@ -3465,12 +3470,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     lastMsgId: MessageId,
   ): void {
     this.requireBranchMutation('enqueueMergeForRange');
-    const sourceLevel = targetLevel - 1;
+    const ceiling = this.config.maxMergeLevel ?? 3;
+    const mergeLevel = targetLevel > ceiling ? ceiling : targetLevel;
+    const sourceLevel = targetLevel > ceiling ? ceiling : targetLevel - 1;
 
     // IDs already enqueued at this target level.
     const queuedAtLevel = new Set<string>();
     for (const m of this.mergeQueue) {
-      if (m.level === targetLevel) {
+      if (m.level === mergeLevel) {
         for (const id of m.sourceIds) queuedAtLevel.add(id);
       }
     }
@@ -3507,8 +3514,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
     const cfg = getLevelConfig(sourceLevel, this.config);
     const toMerge = sources.slice(0, Math.max(1, cfg.mergeCount));
+    // The ceiling level's default mergeCount is 0, so the slice can hand back a
+    // singleton even when several sources qualify — a merge that renames one
+    // summary, spends an LLM call, and leaves the demand unsatisfied.
+    if (toMerge.length < 2) return;
     this.enqueueMerge({
-      level: targetLevel as SummaryLevel,
+      level: mergeLevel as SummaryLevel,
       sourceIds: toMerge.map((s) => s.id),
     });
   }
@@ -7476,6 +7487,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * Walk the summary tree to find the L_k ancestor of a message.
    * Returns null if no ancestor exists at that level (e.g., L_k not yet produced).
    *
+   * Returns the TOPMOST entry at that level: a merge-in-place consolidation
+   * parents its sources to a broader SAME-level entry, and emission dedups on
+   * the returned id (`emittedAncestors`), so a merged-away child would emit one
+   * recall pair per source instead of one for the consolidation — and diverge
+   * from what the picker planned.
+   *
    * Takes a pre-built summariesById map to avoid O(summaries) lookups per
    * call — for a chronicle with thousands of summaries and hundreds of
    * middle messages, the O(n) `find` would dominate compile latency.
@@ -7498,7 +7515,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       current = lookup(parentId);
     }
     if (!current || current.level !== level) return null;
-    return current;
+    return topmostAtSameLevel(current, getSummaryParentId, lookup);
   }
 
   /**

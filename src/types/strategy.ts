@@ -1055,6 +1055,37 @@ export function getSummaryParentId(s: SummaryEntry): string | undefined {
 }
 
 /**
+ * Helper: follow same-level parent links to the topmost entry at this level.
+ *
+ * A merge at `maxMergeLevel` consolidates N entries into ONE broader entry at
+ * the SAME level (merge-in-place), so a merged-away source's parent sits at
+ * its own level rather than level+1. Every ancestor walk must land on the
+ * topmost such entry: sibling dedup in the picker, the render layout and the
+ * emitter all key on the returned id, so stopping at a merged-away child makes
+ * each source emit its own recall pair and the consolidation never reaches the
+ * rendered context — the merge spends an LLM call and changes nothing.
+ *
+ * `seen` bounds the ascent: a same-level parent cycle in a corrupted store must
+ * terminate rather than hang the compile.
+ */
+export function topmostAtSameLevel<T extends { id: string; level: number }>(
+  node: T,
+  parentIdOf: (n: T) => string | undefined,
+  lookup: (id: string) => T | undefined,
+): T {
+  let cur = node;
+  const seen = new Set<string>([cur.id]);
+  for (;;) {
+    const parentId = parentIdOf(cur);
+    if (!parentId) return cur;
+    const up = lookup(parentId);
+    if (!up || up.level !== cur.level || seen.has(up.id)) return cur;
+    seen.add(up.id);
+    cur = up;
+  }
+}
+
+/**
  * A range of messages protected from compression. Pins keep a span of raw
  * messages visible at their original position in the rendered context.
  *
