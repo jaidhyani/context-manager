@@ -527,6 +527,21 @@ export interface AutobiographicalConfig {
   /** Model to use for compression (defaults to claude-sonnet) */
   compressionModel?: string;
   /**
+   * How L1 compression calls are built.
+   *
+   * 'separate' (default): each compression call builds its own context from
+   *   scratch — head window, recall frontier, raw middle, chunk, instruction.
+   *   This creates a separate cache lineage from the main conversation.
+   *
+   * 'inline': compression appends an instruction to the most recently compiled
+   *   main-conversation context. The main context prefix (~186K on a large
+   *   resident) is already cached, so the compression call reads it at 0.1x
+   *   instead of writing its own ~48K prefix at 2x. Requires that the chunk
+   *   messages are present in the last compile output. Falls back to 'separate'
+   *   when they aren't (e.g. before the first compile or after a store reset).
+   */
+  compressionMode?: 'inline' | 'separate';
+  /**
    * Hard cap on `max_tokens` for compression requests. The summarizer asks for
    * `max(16000, targetChunkTokens * 1.5)` so folds are not truncated mid-memory,
    * but that floor exceeds what older models will accept as OUTPUT: Claude 3
@@ -796,9 +811,40 @@ export interface AutobiographicalConfig {
    *   'kv-stable' — the KV-stable context controller: minimizes real prefix
    *     churn directly (flat zone + per-turn reach cap; no λ). Built per-compile
    *     from the live PickerInputs. See docs/kv-stable-context-control.md.
+   *   'lsm-compaction' — layered cascade (LSM-style): the middle is held as
+   *     L1/L2/bottom layers, raw chunks aging out of the tail are taken into
+   *     L1 under a per-compile cap, and each layer overflows by cut-first-k.
+   *     Changes stay boundary-local, so most turns are pure append.
    * Custom strategies can be plugged in by the host application.
    */
-  foldingStrategy?: 'flat-profile' | 'oldest-first' | 'kv-stable';
+  foldingStrategy?: 'flat-profile' | 'oldest-first' | 'kv-stable' | 'lsm-compaction';
+
+  /**
+   * Layer budget split [L1, L2, bottom] as fractions of the middle budget, for
+   * `foldingStrategy: 'lsm-compaction'`. Default [0.45, 0.35, 0.20].
+   */
+  lsmLayerBudgetRatios?: [number, number, number];
+
+  /**
+   * Deepest fold level `foldingStrategy: 'lsm-compaction'` will target.
+   * Default 4.
+   */
+  lsmMaxFoldLevel?: number;
+
+  /**
+   * Tokens a layer may sit over its threshold before a cascade fires, for
+   * `foldingStrategy: 'lsm-compaction'`. Hysteresis against thrash.
+   * Default 2000.
+   */
+  lsmCascadeHysteresis?: number;
+
+  /**
+   * Cut size (tokens) for L1->L2 promotion under
+   * `foldingStrategy: 'lsm-compaction'`; L2->bottom derives from the L2
+   * threshold. Also the scale the step-1 intake cap is matched to, so intake
+   * cannot add more than one cut's worth to L1 per compile. Default 8000.
+   */
+  lsmPromotionSize?: number;
 
   /**
    * Trust region P (tokens) for `foldingStrategy: 'kv-stable'` — bounds how
@@ -827,6 +873,13 @@ export interface AutobiographicalConfig {
    * and budget. Default 0.1.
    */
   compressionSlackRatio?: number;
+
+  /**
+   * Prompt-cache TTL for the breakpoints placed in COMPRESSION (summarizer /
+   * merge) requests — after the head and after the recall frontier. Local
+   * patch 2026-08-22; default '1h' to match the live compile's cacheTtl.
+   */
+  compressionCacheTtl?: '5m' | '1h';
 
   /**
    * Enable bottom-up speculative pre-production of higher-level summaries.

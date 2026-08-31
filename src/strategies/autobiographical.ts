@@ -38,6 +38,7 @@ import { createHash } from 'node:crypto';
 import { Picker, OverBudgetError, UncoveredDropError, type PickerChunk, type PickerInputs } from '../adaptive/picker.js';
 import { FlatProfileStrategy } from '../adaptive/strategies/flat-profile.js';
 import { KvStableStrategy } from '../adaptive/strategies/kv-stable.js';
+import { LsmCompactionStrategy } from '../adaptive/strategies/lsm-compaction.js';
 import { OldestFirstStrategy } from '../adaptive/strategies/oldest-first.js';
 import type {
   FoldingSolver,
@@ -664,6 +665,52 @@ function stripEmptyTextBlocks(content: ContentBlock[]): ContentBlock[] {
 }
 
 /**
+ * Prompt-cache breakpoint for COMPRESSION requests (local patch, 2026-08-22).
+ *
+ * A summarizer prompt re-sends the tools, the head and the whole recall
+ * frontier around a ~4k chunk, and until now carried no cache_control at all —
+ * ~50k of byte-identical prefix re-billed at full price on every one of the
+ * 30–120 compression calls a day (Saga/Aesop, Team seat exhausted 2026-08-22).
+ * The live compile already caches its prefix; this gives the summarizer the
+ * same treatment: a marker after the head (tools+head never change) and one
+ * after the recall frontier (append-mostly, so the previous call's boundary is
+ * within Anthropic's 20-block lookback).
+ *
+ * Block-level, not message-level: the message-level `cacheBreakpoint` flag does
+ * not survive splitMixedToolMessages / collapseConsecutiveMessages /
+ * stripUnpairedToolBlocks, which all rebuild {participant, content}; content
+ * blocks ride through those by reference and membrane's native formatter
+ * preserves `cache_control` on text blocks. The marked block is CLONED so the
+ * store's own block object is never mutated — a marker leaking into the live
+ * compile could push a 4-marker turn past the API's hard cap.
+ */
+function withCompressionCacheBreakpoint(
+  content: ContentBlock[],
+  ttl: '5m' | '1h',
+): ContentBlock[] {
+  for (let k = content.length - 1; k >= 0; k--) {
+    const b = content[k] as { type: string; text?: unknown };
+    if (b.type === 'text' && typeof b.text === 'string' && b.text.trim().length > 0) {
+      const out = content.slice();
+      out[k] = { ...(content[k] as object), cache_control: { type: 'ephemeral', ttl } } as ContentBlock;
+      return out;
+    }
+  }
+  return content;
+}
+
+/** Mark the LAST message of `msgs` (in place on the array, cloned block) — see
+ *  withCompressionCacheBreakpoint. No-op on an empty array. */
+function markLastForCompressionCache(
+  msgs: Array<{ participant: string; content: ContentBlock[] }>,
+  ttl: '5m' | '1h',
+): void {
+  if (msgs.length === 0) return;
+  const last = msgs[msgs.length - 1];
+  msgs[msgs.length - 1] = { participant: last.participant, content: withCompressionCacheBreakpoint(last.content, ttl) };
+}
+
+/**
  * Strip `thinking` / `redacted_thinking` blocks from RAW messages entering
  * compression input.
  *
@@ -865,6 +912,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   private mergeQuarantineAlarmLastAt = 0;
   private mergeQuarantineAlarmActive = false;
   protected nativeFormatter = new NativeFormatter();
+
+  /**
+   * Snapshot of the last non-dryRun select() output: the ContextEntry[] and the
+   * message IDs they cover. Used by inline compression to build a request that
+   * shares the main conversation's cache prefix.
+   */
 
   /** Message ID from which the head window starts. null = start from message 0. */
   protected headWindowStartId: string | null = null;
@@ -3718,12 +3771,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // Image stripping runs inside each select path (before stats commit / cache
     // markers), so the returned entries are already bounded — see
     // applyImageStripping.
+    let entries: ContextEntry[];
     if (this.config.adaptiveResolution) {
-      return this.selectAdaptive(store, budget, opts);
+      entries = this.selectAdaptive(store, budget, opts);
+    } else {
+      // selectHierarchical commits nothing (no state-slot writes, no enqueue),
+      // so it is already dry-run-safe and needs no gating.
+      entries = this.selectHierarchical(store, budget);
     }
-    // selectHierarchical commits nothing (no state-slot writes, no enqueue),
-    // so it is already dry-run-safe and needs no gating.
-    return this.selectHierarchical(store, budget);
+
+    return entries;
   }
 
   /**
@@ -4270,8 +4327,24 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
 
     let emittedTokens = 0;
+    const chunkByMsgId = new Map<string, Chunk>();
+    for (const ch of this.chunks) {
+      for (const m of ch.messages) chunkByMsgId.set(m.id, ch);
+    }
+    let prevChunk: Chunk | undefined;
     for (const i of accepted) {
       const msg = messages[i];
+      const curChunk = chunkByMsgId.get(msg.id);
+      if (prevChunk && curChunk && curChunk !== prevChunk) {
+        entries.push({
+          index: entries.length,
+          participant: 'Context Manager',
+          content: [{ type: 'text', text: '[Fold boundary]' }],
+          sourceRelation: 'derived',
+        });
+        emittedTokens += 5;
+      }
+      prevChunk = curChunk;
       const content = msgCap > 0 ? this.truncateContent(msg.content, msgCap) : msg.content;
       const tokens = msgCap > 0 ? Math.min(est(i), msgCap + 50) : est(i);
       entries.push({
@@ -4325,6 +4398,164 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     );
 
     return { shownL1, shownL2, shownL3 };
+  }
+
+  /**
+   * Inline compression: compile the current context via select(), append
+   * compression instructions, and call the model. The compiled prefix
+   * shares the main conversation's cache.
+   */
+  private async tryInlineCompression(
+    chunk: Chunk,
+    ctx: StrategyContext,
+  ): Promise<'done'> {
+    const targetTokens = this.config.summaryTargetTokens ?? 2000;
+    const model = this.requireCompressionModel();
+
+    const budget: TokenBudget = {
+      maxTokens: this.normalizedCompressionContextBudget(),
+      reserveForResponse: Math.max(16000, Math.round(targetTokens * 1.5)),
+    };
+    const entries = this.select(ctx.messageStore, ctx.contextLog, budget);
+
+    const messages: Array<{ participant: string; content: ContentBlock[] }> = [];
+    for (const entry of entries) {
+      const splitParts = splitMixedToolMessages([
+        { participant: entry.participant, content: entry.content },
+      ]);
+      for (const part of splitParts) {
+        messages.push({ participant: part.participant, content: part.content });
+      }
+    }
+
+    // Append the compression instruction as a new turn.
+    // The chunk's messages are already in the compiled context — the model just
+    // needs to know which slice to summarize and what format to produce.
+    const docContext = this.detectDocContext(chunk, ctx);
+    const instructionText = this.applyIdentityReminder(
+      docContext
+        ? this.getReadingChunkInstruction(chunk, docContext.totalTokens, targetTokens)
+        : this.getCompressionInstruction(chunk, targetTokens),
+    );
+
+    const pct = chunk.tokens > 0 ? Math.round((targetTokens / chunk.tokens) * 100) : 20;
+    messages.push({
+      participant: 'Context Manager',
+      content: [{
+        type: 'text',
+        text:
+          `[COMPRESSION TASK]\n\n` +
+          `Time to form a new memory. The section to remember is your recent experience ` +
+          `from [Recent experience begins] to the first [Fold boundary]` +
+          ` (or to the end, if there's no fold boundary yet).\n\n` +
+          `This will become an [L1] memory — like the ones above. ` +
+          `Target about ${targetTokens} tokens (~${pct}% of the ~${chunk.tokens}-token section). ` +
+          `Just write the memory itself; the system handles the label.\n\n` +
+          `Speak in the first person from your own perspective. ` +
+          `Preserve concrete details — file paths, exact values, decisions, ` +
+          `unresolved questions, active asks. Memorize only what actually happened ` +
+          `in that section — not events from your older memories above, even if ` +
+          `they're visible.`,
+      }],
+    });
+
+    const collapsed = this.collapseConsecutiveMessages(messages);
+    const cleaned = stripUnpairedToolBlocks(collapsed);
+
+    const request: NormalizedRequest = {
+      shedOversizeImages: true,
+      messages: cleaned
+        .map(m => ({ participant: m.participant, content: stripEmptyTextBlocks(m.content) }))
+        .filter(m => m.content.length > 0),
+      config: {
+        model,
+        maxTokens: this.capCompressionTokens(Math.max(16000, Math.round(targetTokens * 1.5))),
+      },
+      tools: ctx.tools,
+    };
+
+    const callStart = Date.now();
+    let response: NormalizedResponse;
+    try {
+      response = await ctx.membrane!.complete(
+        request,
+        { formatter: this.nativeFormatter },
+      ) as NormalizedResponse;
+    } catch (error) {
+      throw new Error(`[autobiographical] inline compression API call failed: ${error}`);
+    }
+
+    const stopReason = this.compressionResponseStopReason(response);
+    if (stopReason !== 'end_turn') {
+      throw new Error(`[autobiographical] inline compression: unexpected stop_reason=${stopReason}`);
+    }
+
+    if (response.content.some((b: ContentBlock) => b.type === 'tool_use')) {
+      throw new Error('[autobiographical] inline compression: model emitted tool_use instead of memory text');
+    }
+
+    const summaryText = stripThinkingPreamble(
+      response.content
+        .filter((b): b is { type: 'text'; text: string } => b.type === 'text')
+        .map(b => b.text)
+        .join('\n'),
+    );
+    const responseContent = captureResponseContent(response.content);
+
+    if (!summaryText.trim()) {
+      throw new Error('[autobiographical] inline compression: model returned empty response');
+    }
+
+    const messageIds = chunk.messages.map(m => m.id);
+    const entry: SummaryEntry = {
+      id: `L1-${this.nextSummaryIdCounter()}`,
+      level: 1,
+      content: summaryText,
+      tokens:
+        response.usage?.outputTokens && response.usage.outputTokens > 0
+          ? response.usage.outputTokens
+          : Math.ceil(summaryText.length / 3),
+      sourceLevel: 0,
+      sourceIds: messageIds,
+      sourceRange: {
+        first: messageIds[0],
+        last: messageIds[messageIds.length - 1],
+      },
+      created: Date.now(),
+      phaseType: chunk.phaseType,
+      ...(this.chunkIsWitnessed(chunk) ? { witnessed: true } : {}),
+      ...(responseContent ? { responseContent } : {}),
+      provenance: {
+        stopReason: 'end_turn',
+        requestHash: sha256Json(request),
+        model,
+      },
+    };
+
+    this.pushSummary(entry);
+    chunk.compressed = true;
+    chunk.summaryId = entry.id;
+    this.markChunkRecordCompressed(chunk.recordId, entry.id);
+    this._compressionCount++;
+
+    logCompressionCall({
+      operation: 'compress_l1',
+      mode: 'inline',
+      system: null,
+      messages: [],
+      metadata: {
+        chunk_message_ids: messageIds,
+        chunk_size: chunk.messages.length,
+        summary_id: entry.id,
+        duration_ms: Date.now() - callStart,
+        input_tokens: response.usage?.inputTokens,
+        output_tokens: response.usage?.outputTokens,
+      },
+      response: summaryText.slice(0, 500),
+    });
+
+    this.checkMergeThreshold();
+    return 'done';
   }
 
   /**
@@ -4465,6 +4696,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
     }
 
+    // ---- Inline compression path ----
+    // When compressionMode is 'inline', append compression instructions to the
+    // last compiled main-conversation context instead of building a separate one.
+    // The main context prefix is already cached; this reuses it at 0.1x read
+    // pricing instead of writing a separate ~48K prefix at 2x.
+    if (this.config.compressionMode === 'inline') {
+      await this.tryInlineCompression(chunk, ctx);
+      return;
+    }
+
     // Build the KV-preserving prompt per hermes-autobio spec:
     //
     //   1. Head — the raw chronicle opening (identity anchor), FIRST,
@@ -4511,13 +4752,23 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // optimization that scales catastrophically: a 4000-message import
     // converged to ~500 L1s that never aged out, blowing the 200k
     // window around chunk 118.
-    const priorSummaries = this.summaries
+    const priorSummariesUnordered = this.summaries
       // Skip empty-content summaries: emitting `{type:'text', text:''}` as a
       // recall pair triggers Anthropic 400 "text content blocks must be
       // non-empty", which stalls ALL compression (mirrors the render-path guard
       // + load-drop). A single empty summary otherwise poisons every compression.
       .filter((s) => !s.mergedInto && !!s.content && s.content.trim().length > 0)
-      .sort((a, b) => a.sourceRange.first.localeCompare(b.sourceRange.first));
+      ;
+    // Order by message POSITION, not string compare (local patch 2026-08-22; upstream fixed
+    // the same bug in anima-research/context-manager PR #65 / 08a3945, unreleased as of 0.6.3 —
+    // retire this patch on upgrade). `sourceRange.first` is a numeric message ID serialised as a string, so
+    // localeCompare put "18" after "1672": the oldest L3 rendered LAST, a new L1 with a
+    // 17xx first-ID was inserted before it, and every order-of-magnitude crossing of the
+    // message counter (10000 > "1156"? no: "10000" < "1156") would scramble the frontier
+    // again. Consequences: the agent's prior memories replayed out of chronological order,
+    // and the compression prompt's cached prefix re-keyed mid-frontier. Same rule the merge
+    // builder already uses; capRecallPairs() expects chronological input.
+    const priorSummaries = this.sortSummariesChronologically(priorSummariesUnordered, allMessages);
 
     // Leaf message coverage of every live summary — the rendering
     // authority for the one-to-one invariant: a message covered by a
@@ -4573,6 +4824,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
       llmMessages.push({ participant: m.participant, content: stripThinkingBlocks(m.content) });
     }
+    // Cache breakpoint #1: tools + head (local patch 2026-08-22, see withCompressionCacheBreakpoint).
+    const compressionCacheTtl = this.config.compressionCacheTtl ?? '1h';
+    markLastForCompressionCache(llmMessages, compressionCacheTtl);
     if (headCoveredSkipped > 0) {
       console.warn(
         `autobio: ${headCoveredSkipped} head-window message(s) are covered by live summaries; ` +
@@ -4632,6 +4886,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         content: this.summaryAnswerContent(s),
       });
     }
+    // Cache breakpoint #2: end of the recall frontier (append-mostly between calls).
+    if (keptSummaries.length > 0) markLastForCompressionCache(llmMessages, compressionCacheTtl);
 
     // ---- 3. Raw middle ----
     // Any raw messages between the head and the chunk that aren't yet
@@ -4736,6 +4992,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // preserve pixels — and membrane error-logs every exercised shed. All
       // other callers fail loudly instead (no silent transport mutation).
       shedOversizeImages: true,
+      // Compression input is a unique chunk that never repeats, so membrane's
+      // floating end-of-context marker would be a pure cache-write cost here.
+      // The compression breakpoints (after the head, after the recall
+      // frontier) are placed by markLastForCompressionCache instead.
+      // Local patch 2026-08-29.
+      floatingCacheMarker: false,
       // Sanitize: strip empty text blocks (`{type:'text',text:''}`) and drop any
       // message left with no content. An empty-content turn (e.g. a silent/skip
       // turn that produced no text) otherwise reaches the API as an empty text
@@ -5641,6 +5903,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
       llmMessages.push({ participant: m.participant, content: stripThinkingBlocks(m.content) });
     }
+    // Cache breakpoint #1: tools + head (local patch 2026-08-22, see withCompressionCacheBreakpoint).
+    const compressionCacheTtl = this.config.compressionCacheTtl ?? '1h';
+    markLastForCompressionCache(llmMessages, compressionCacheTtl);
     if (headCoveredSkipped > 0) {
       console.warn(
         `autobio: ${headCoveredSkipped} head-window message(s) are covered by live summaries or ` +
@@ -5716,6 +5981,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         content: this.summaryAnswerContent(s),
       });
     }
+    // Cache breakpoint #2: end of the prior recall frontier.
+    if (keptPriorSummaries.length > 0) markLastForCompressionCache(llmMessages, compressionCacheTtl);
 
     // Raw middle: any messages between the head window and the merge
     // range that aren't covered by a prior summary or the merge tree.
@@ -5839,6 +6106,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // preserve pixels — and membrane error-logs every exercised shed. All
       // other callers fail loudly instead (no silent transport mutation).
       shedOversizeImages: true,
+      // Compression input is a unique chunk that never repeats, so membrane's
+      // floating end-of-context marker would be a pure cache-write cost here.
+      // The compression breakpoints (after the head, after the recall
+      // frontier) are placed by markLastForCompressionCache instead.
+      // Local patch 2026-08-29.
+      floatingCacheMarker: false,
       // Sanitize: strip empty text blocks (`{type:'text',text:''}`) and drop any
       // message left with no content. An empty-content turn (e.g. a silent/skip
       // turn that produced no text) otherwise reaches the API as an empty text
@@ -6448,7 +6721,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     //    one continuous user message instead of N turns.
     //  - bodyGroupId absent: emit normally (raw L0 message, or Q+A summary pair).
     const emittedAncestors = new Set<SummaryId>();
-    const summaryLabel = this.config.summaryContextLabel ?? 'What do you remember from earlier?';
+    const baseSummaryLabel = this.config.summaryContextLabel ?? 'What do you remember from earlier?';
+    const summaryLabelFor = (id: string) => `[${id}] ${baseSummaryLabel}`;
     const summaryParticipant = this.config.summaryParticipant ?? 'Claude';
 
     // Emission-overflow refusal: the picker planned this layout to fit, so an
@@ -6547,7 +6821,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               const questionEntry: ContextEntry = {
                 index: entries.length,
                 participant: 'Context Manager',
-                content: [{ type: 'text', text: summaryLabel }],
+                content: [{ type: 'text', text: summaryLabelFor(ancestor.id) }],
                 sourceRelation: 'derived',
               };
               const answerContent: ContentBlock[] = this.summaryAnswerContent(ancestor);
@@ -6557,6 +6831,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
                 content: msgCap > 0 ? this.truncateContent(answerContent, msgCap) : answerContent,
                 sourceRelation: 'derived',
               };
+              (answerEntry as unknown as { summaryLevel?: number }).summaryLevel = ancestor.level; // cache-seams local patch 2026-08-29
               const pairTokens = this.estimateTokens(questionEntry.content) + this.estimateTokens(answerEntry.content);
               if (totalTokens + pairTokens > prefixBudget) {
                 throw emissionOverBudget(totalTokens + pairTokens, ancestor.level);
@@ -6656,7 +6931,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         const questionEntry: ContextEntry = {
           index: entries.length,
           participant: 'Context Manager',
-          content: [{ type: 'text', text: summaryLabel }],
+          content: [{ type: 'text', text: summaryLabelFor(ancestor.id) }],
           sourceRelation: 'derived',
         };
         const answerContent: ContentBlock[] = this.summaryAnswerContent(ancestor);
@@ -6666,6 +6941,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           content: msgCap > 0 ? this.truncateContent(answerContent, msgCap) : answerContent,
           sourceRelation: 'derived',
         };
+        (answerEntry as unknown as { summaryLevel?: number }).summaryLevel = ancestor.level; // cache-seams local patch 2026-08-29
         const pairTokens = this.estimateTokens(questionEntry.content) + this.estimateTokens(answerEntry.content);
         if (totalTokens + pairTokens > prefixBudget) {
           throw emissionOverBudget(totalTokens + pairTokens, ancestor.level);
@@ -6677,6 +6953,23 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         i++;
       }
     }
+    }
+
+    // ----- 5b. Memory-to-live boundary note (lsm-compaction only) -----
+    if (this.config.foldingStrategy === 'lsm-compaction') {
+      const boundaryNote: ContextEntry = {
+        index: entries.length,
+        participant: 'Context Manager',
+        content: [{ type: 'text', text:
+          '[Recent experience begins] The conversation below is your recent experience ' +
+          '— raw, not yet summarized. The oldest parts will eventually be compressed ' +
+          'into memories like the ones above.',
+        }],
+        sourceRelation: 'derived',
+      };
+      const noteTokens = this.estimateTokens(boundaryNote.content);
+      entries.push(boundaryNote);
+      totalTokens += noteTokens;
     }
 
     // ----- 6. Emit the fully-reserved tail -----
@@ -6854,12 +7147,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /**
-   * Place up to four `cache_control` breakpoints across the final ordered
-   * entries: the head/system boundary, the end of the folded history (the
-   * stable prefix that persists turn-to-turn — the most valuable), a mid-history
-   * seam, and the very end (for pure-append reuse). Mirrors `placeMarkers` in
-   * the adaptive layer but operates on emitted entries. Idempotent; clears any
-   * pre-existing markers first.
+   * Place up to three message-level `cache_control` breakpoints at summary
+   * layer boundaries — the last pair of each summary layer, preferring the
+   * deepest layers. Membrane's floating cache marker rides the end of every
+   * request and supplies the fourth breakpoint (Anthropic caps 4 per request
+   * incl. system/tools, which membrane marks only as a fallback when no
+   * message marker exists). Cache-seams local patch v2, 2026-08-29.
+   * Idempotent; clears any pre-existing markers first.
    */
   protected placeCacheMarkers(
     entries: ContextEntry[],
@@ -6870,41 +7164,26 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const n = entries.length;
     if (n === 0) return;
 
-    let lastHead = -1;
-    let firstTail = n;
+    // One marker per summary layer, at the last pair of that layer. Deeper
+    // layers fold least often, so prefer the 3 deepest when more exist.
+    // Membrane's floating marker rides the end of every request (the 4th
+    // breakpoint). Design + wire evidence:
+    // clai data/memory/2026-08-29/saga-context-ledger-viz.md.
+    const lastByLevel = new Map<number, number>();
     for (let i = 0; i < n; i++) {
-      const sid = entries[i].sourceMessageId;
-      if (sid && headMessageIds.has(sid)) lastHead = i;
+      const lv = (entries[i] as ContextEntry & { summaryLevel?: number }).summaryLevel;
+      if (lv !== undefined) lastByLevel.set(lv, i);
     }
-    for (let i = 0; i < n; i++) {
-      const sid = entries[i].sourceMessageId;
-      if (sid && tailMessageIds.has(sid)) { firstTail = i; break; }
-    }
-    const historyEnd = firstTail - 1; // last middle (folded-history) entry
-
-    const marks = new Set<number>();
-    if (lastHead >= 0) marks.add(lastHead);                       // system / head block
-    if (historyEnd > lastHead) marks.add(historyEnd);            // stable folded prefix (the big one)
-    if (historyEnd - lastHead > 2) marks.add(lastHead + Math.floor((historyEnd - lastHead) / 2)); // mid-history
-    marks.add(n - 1);                                            // end → pure-append reuse
-
-    // The Anthropic limit is 4 cache_control blocks per request INCLUDING the
-    // system block, which membrane marks whenever prompt caching is on. So
-    // message-level markers must never exceed 3 — with all four seams placed
-    // (possible only once folds exist; pre-fold only 2 seams materialize) the
-    // request hard-400s: "A maximum of 4 blocks with cache_control may be
-    // provided. Found 5." (Rhys, 2026-07-26 — his first fold-active compile.)
-    // Drop the mid-history seam first: head and folded-prefix markers protect
-    // the expensive stable prefixes and the end marker buys pure-append
-    // reuse; the mid seam is the cheapest to lose. Deliberately NOT fixed by
-    // stripping in membrane — silently dropped markers are silently broken
-    // caching, which is an invisible-cost bug; the supplier stays within the
-    // global budget instead.
-    if (marks.size > 3) {
-      marks.delete(lastHead + Math.floor((historyEnd - lastHead) / 2));
+    if (lastByLevel.size === 0) {
+      console.warn(
+        '[autobiographical] placeCacheMarkers: no summary-layer boundaries — ' +
+          'relying on membrane fallback + floating end marker only',
+      );
+      return;
     }
 
-    for (const idx of marks) if (idx >= 0 && idx < n) entries[idx].cacheMarker = true;
+    const sorted = [...lastByLevel.entries()].sort(([a], [b]) => b - a);
+    for (const [, idx] of sorted.slice(0, 3)) entries[idx].cacheMarker = true;
   }
 
   /**
@@ -7037,6 +7316,21 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         strictReach: preparedBudget !== undefined,
       });
       this._lastKvStable = strategy;
+      return new Picker(strategy);
+    }
+    if (this.config.foldingStrategy === 'lsm-compaction') {
+      const totalBudget = preparedBudget?.totalBudget ?? this.config.contextBudgetTokens ?? 160000;
+      const middleBudget = Math.max(0, totalBudget - inputs.headTokens - inputs.tailTokens);
+      const strategy = new LsmCompactionStrategy(
+        {
+          layerBudgetRatios: this.config.lsmLayerBudgetRatios,
+          maxFoldLevel: this.config.lsmMaxFoldLevel,
+          cascadeHysteresis: this.config.lsmCascadeHysteresis,
+          promotionSize: this.config.lsmPromotionSize,
+        },
+        middleBudget,
+      );
+      this._lastKvStable = null;
       return new Picker(strategy);
     }
     this._lastKvStable = null;
