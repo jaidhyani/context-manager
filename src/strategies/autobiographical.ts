@@ -50,7 +50,28 @@ import type {
 import { chunkMessage, DEFAULT_CHUNKER_OPTIONS } from '../adaptive/chunker.js';
 import { observeStoreBranch } from '../branch-generation.js';
 import type { MessageId } from '../types/message.js';
-import type { IngressChunkResult } from '../types/strategy.js';
+import type { IngressChunkResult, LevelConfig } from '../types/strategy.js';
+
+const LEVEL_DEFAULTS: Record<number, Required<LevelConfig>> = {
+  1: { targetTokens: 5000, maxTokens: 10000, maxEntries: 6, mergeCount: 3 },
+  2: { targetTokens: 8000, maxTokens: 15000, maxEntries: 6, mergeCount: 3 },
+  3: { targetTokens: 12000, maxTokens: 20000, maxEntries: Infinity, mergeCount: 0 },
+};
+
+function getLevelConfig(
+  level: number,
+  config: AutobiographicalConfig,
+): Required<LevelConfig> {
+  const key = `L${level}` as 'L1' | 'L2' | 'L3';
+  const perLevel = config.levels?.[key] ?? {};
+  const defaults = LEVEL_DEFAULTS[level] ?? LEVEL_DEFAULTS[3];
+  return {
+    targetTokens: perLevel.targetTokens ?? config.summaryTargetTokens ?? defaults.targetTokens,
+    maxTokens: perLevel.maxTokens ?? config.compressionMaxTokens ?? defaults.maxTokens,
+    maxEntries: perLevel.maxEntries ?? config.mergeThreshold ?? defaults.maxEntries,
+    mergeCount: perLevel.mergeCount ?? defaults.mergeCount,
+  };
+}
 
 /**
  * Append a JSONL entry describing one compression LLM call to the path
@@ -3484,8 +3505,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
     if (sources.length < 2) return;
 
-    const N = this.config.mergeThreshold ?? 6;
-    const toMerge = sources.slice(0, N);
+    const cfg = getLevelConfig(sourceLevel, this.config);
+    const toMerge = sources.slice(0, Math.max(1, cfg.mergeCount));
     this.enqueueMerge({
       level: targetLevel as SummaryLevel,
       sourceIds: toMerge.map((s) => s.id),
@@ -4089,8 +4110,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * below the 16k floor (Claude 3 Opus: 4096) fails every fold with a 400 and
    * silently never compresses.
    */
-  protected capCompressionTokens(requested: number): number {
-    const cap = this.config.compressionMaxTokens;
+  protected capCompressionTokens(requested: number, levelMaxTokens?: number): number {
+    const cap = levelMaxTokens ?? this.config.compressionMaxTokens;
     if (typeof cap === 'number' && cap > 0) return Math.min(requested, cap);
     return requested;
   }
@@ -4409,7 +4430,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     chunk: Chunk,
     ctx: StrategyContext,
   ): Promise<'done'> {
-    const targetTokens = this.config.summaryTargetTokens ?? 2000;
+    const l1 = getLevelConfig(1, this.config);
+    const targetTokens = l1.targetTokens;
     const model = this.requireCompressionModel();
 
     const budget: TokenBudget = {
@@ -4469,7 +4491,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         .filter(m => m.content.length > 0),
       config: {
         model,
-        maxTokens: this.capCompressionTokens(Math.max(16000, Math.round(targetTokens * 1.5))),
+        maxTokens: this.capCompressionTokens(Math.max(16000, Math.round(targetTokens * 1.5)), l1.maxTokens),
       },
       tools: ctx.tools,
     };
@@ -4635,7 +4657,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       return;
     }
 
-    const targetTokens = this.config.summaryTargetTokens ?? 2000;
+    const l1 = getLevelConfig(1, this.config);
+    const targetTokens = l1.targetTokens;
     const agentParticipant = this.config.summaryParticipant ?? 'Claude';
 
     // ---- 0. Thin-chunk guard ----
@@ -5017,7 +5040,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // targetTokens is a *target*, not a cap, and adaptive models routinely
         // overshoot a ~2k target. Was `* 1.5` (=3000 at the 2k default), which cut
         // off rich memories (stop=max_tokens).
-        maxTokens: this.capCompressionTokens(Math.max(16000, Math.round(targetTokens * 1.5))),
+        maxTokens: this.capCompressionTokens(Math.max(16000, Math.round(targetTokens * 1.5)), l1.maxTokens),
       },
       // Declare the agent's live tools. A summarizer request that replays
       // tool_use/tool_result history with NO tools param reads to Anthropic's
@@ -5596,9 +5619,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    */
   protected contiguousMergeCandidates(
     unmerged: SummaryEntry[],
-    threshold: number,
+    maxEntries: number,
+    mergeCount: number,
   ): SummaryEntry[] | null {
-    if (unmerged.length < threshold) return null;
+    if (unmerged.length < maxEntries) return null;
     const messageOrder = new Map<MessageId, number>();
     let seq = 0;
     for (const ch of this.chunks) {
@@ -5611,12 +5635,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const first = messageOrder.get(s.sourceRange.first);
       const last = messageOrder.get(s.sourceRange.last);
       if (first === undefined || last === undefined) continue;
-      if (Math.abs(last - first) > spanLimit) continue; // wide-span quarantine
+      if (Math.abs(last - first) > spanLimit) continue;
       withPos.push({ s, first: Math.min(first, last), last: Math.max(first, last) });
     }
     withPos.sort((a, b) => a.first - b.first);
 
-    // Split into contiguous runs (a gap larger than `gapLimit` starts a new one).
     const runs: Array<typeof withPos> = [];
     let run: typeof withPos = [];
     let runEnd = -Infinity;
@@ -5632,19 +5655,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     if (run.length > 0) runs.push(run);
     if (runs.length === 0) return null;
 
-    // ONLY THE NEWEST RUN CAN GROW (2026-07-12 starvation fix). Summaries are
-    // always produced at the live end, so any INTERIOR run is stranded: it can
-    // never reach `threshold` members, and waiting for it froze the whole
-    // pyramid (mythos: L1 frontier [913-981]x5 + [4039-4131]x5 separated by a
-    // 3058-message hole from the poison-node surgery — 10 unmerged L1s, 8
-    // unmerged L2s, merge queue empty, fold floor climbing to 117k until the
-    // picker died). Interior runs consolidate as soon as they have 2 members;
-    // only the newest run waits for the full threshold.
+    // Sliding window: take the oldest mergeCount entries, not the whole run.
+    // Interior runs (stranded by gaps) consolidate as soon as they have 2.
+    const take = Math.max(1, mergeCount);
     for (let i = 0; i < runs.length; i++) {
       const r = runs[i];
       const isNewest = i === runs.length - 1;
-      if (r.length >= threshold) return r.slice(0, threshold).map((x) => x.s);
-      if (!isNewest && r.length >= 2) return r.slice(0, threshold).map((x) => x.s);
+      if (r.length >= maxEntries) return r.slice(0, take).map((x) => x.s);
+      if (!isNewest && r.length >= 2) return r.slice(0, Math.min(take, r.length)).map((x) => x.s);
     }
     return null;
   }
@@ -5657,8 +5675,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       return;
     }
 
-    const threshold = this.config.mergeThreshold ?? 6;
-
     // IDs that are already part of a queued merge — exclude them from
     // eligibility so we don't re-enqueue.
     const queuedL1 = new Set<string>();
@@ -5669,10 +5685,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
 
     // Check L1 → L2
+    const l1Cfg = getLevelConfig(1, this.config);
     const unmergedL1 = this.summaries.filter(
       s => s.level === 1 && !s.mergedInto && !queuedL1.has(s.id),
     );
-    const l1Run = this.contiguousMergeCandidates(unmergedL1, threshold);
+    const l1Run = this.contiguousMergeCandidates(unmergedL1, l1Cfg.maxEntries, l1Cfg.mergeCount);
     if (l1Run) {
       this.enqueueMerge({
         level: 2,
@@ -5681,10 +5698,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
 
     // Check L2 → L3
+    const l2Cfg = getLevelConfig(2, this.config);
     const unmergedL2 = this.summaries.filter(
       s => s.level === 2 && !s.mergedInto && !queuedL2.has(s.id),
     );
-    const l2Run = this.contiguousMergeCandidates(unmergedL2, threshold);
+    const l2Run = this.contiguousMergeCandidates(unmergedL2, l2Cfg.maxEntries, l2Cfg.mergeCount);
     if (l2Run) {
       this.enqueueMerge({
         level: 3,
@@ -5709,31 +5727,26 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    */
   protected checkMergeThresholdRecursive(): void {
     this.requireBranchMutation('checkMergeThresholdRecursive');
-    const threshold = this.config.mergeThreshold ?? 6;
-
     // Build per-level sets of source-ids already enqueued for merging,
     // so we don't re-enqueue them while a merge is pending.
     const queuedSources = new Map<number, Set<string>>();
     for (const m of this.mergeQueue) {
-      // m.level is the TARGET level; the sources are at level (m.level - 1).
       const sourceLevel = m.level - 1;
       if (!queuedSources.has(sourceLevel)) queuedSources.set(sourceLevel, new Set());
       for (const id of m.sourceIds) queuedSources.get(sourceLevel)!.add(id);
     }
 
-    // Walk every level present in the archive. Iterate from low to high
-    // so when an L_{k+1} merge is enqueued and immediately produced, this
-    // same check sees the new L_{k+1} on the next call and can roll up.
     let maxLevel = 0;
     for (const s of this.summaries) {
       if (s.level > maxLevel) maxLevel = s.level;
     }
     for (let level = 1; level <= maxLevel; level++) {
+      const cfg = getLevelConfig(level, this.config);
       const queued = queuedSources.get(level) ?? new Set();
       const unmerged = this.summaries.filter(
         s => s.level === level && !getSummaryParentId(s) && !queued.has(s.id),
       );
-      const run = this.contiguousMergeCandidates(unmerged, threshold);
+      const run = this.contiguousMergeCandidates(unmerged, cfg.maxEntries, cfg.mergeCount);
       if (run) {
         this.enqueueMerge({
           level: level + 1,
@@ -5777,7 +5790,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       return;
     }
 
-    const targetTokens = this.config.summaryTargetTokens ?? 2000;
+    const levelCfg = getLevelConfig(targetLevel, this.config);
+    const targetTokens = levelCfg.targetTokens;
     const participant = this.config.summaryParticipant ?? 'Claude';
 
     // Build the merge prompt with one-level-deeper target expansion +

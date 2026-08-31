@@ -455,6 +455,17 @@ export interface CompressionQuarantineStatus {
   keys: string[];
 }
 
+export interface LevelConfig {
+  /** Summary target tokens for entries at this level. */
+  targetTokens?: number;
+  /** Hard cap on model output tokens. */
+  maxTokens?: number;
+  /** When unmerged count hits this, merge the oldest mergeCount into next level. */
+  maxEntries?: number;
+  /** How many oldest entries to merge (sliding window). */
+  mergeCount?: number;
+}
+
 export interface AutobiographicalConfig {
   /**
    * Interval for the repeating compression-quarantine alarm (stderr +
@@ -639,6 +650,18 @@ export interface AutobiographicalConfig {
   hierarchical?: boolean;
   /** Number of unmerged summaries before merging to the next level (default: 6) */
   mergeThreshold?: number;
+
+  /**
+   * Per-level configuration for the memory hierarchy. When set, these override
+   * the flat summaryTargetTokens/compressionMaxTokens/mergeThreshold globals
+   * for the specified level. Unset fields fall back to the flat globals, then
+   * to hardcoded defaults.
+   */
+  levels?: {
+    L1?: LevelConfig;
+    L2?: LevelConfig;
+    L3?: LevelConfig;
+  };
   /**
    * Bounded retry policy for L_n merges whose LLM response was rejected by
    * the terminal-disposition gate (refusal / max_tokens truncation /

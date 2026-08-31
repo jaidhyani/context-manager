@@ -38,6 +38,7 @@ export type {
   PreviewResult,
   HotConfigurableStrategy,
   AutobiographicalConfig,
+LevelConfig,
   AutobiographicalOptions,
   CompressionQuarantineStatus,
   SummaryLevel,
