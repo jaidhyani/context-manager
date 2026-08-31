@@ -5709,6 +5709,23 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         sourceIds: l2Run.map(s => s.id),
       });
     }
+
+    // Check L3 merge-in-place (consolidate oldest L3s into a broader L3)
+    const l3Cfg = getLevelConfig(3, this.config);
+    const queuedL3 = new Set<string>();
+    for (const m of this.mergeQueue) {
+      if (m.level === 3) for (const id of m.sourceIds) queuedL3.add(id);
+    }
+    const unmergedL3 = this.summaries.filter(
+      s => s.level === 3 && !s.mergedInto && !queuedL3.has(s.id),
+    );
+    const l3Run = this.contiguousMergeCandidates(unmergedL3, l3Cfg.maxEntries, l3Cfg.mergeCount);
+    if (l3Run) {
+      this.enqueueMerge({
+        level: 3,
+        sourceIds: l3Run.map(s => s.id),
+      });
+    }
   }
 
   /**
@@ -5740,6 +5757,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     for (const s of this.summaries) {
       if (s.level > maxLevel) maxLevel = s.level;
     }
+    const ceiling = this.config.maxMergeLevel ?? 3;
     for (let level = 1; level <= maxLevel; level++) {
       const cfg = getLevelConfig(level, this.config);
       const queued = queuedSources.get(level) ?? new Set();
@@ -5749,7 +5767,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const run = this.contiguousMergeCandidates(unmerged, cfg.maxEntries, cfg.mergeCount);
       if (run) {
         this.enqueueMerge({
-          level: level + 1,
+          level: level >= ceiling ? level : level + 1,
           sourceIds: run.map(s => s.id),
         });
       }

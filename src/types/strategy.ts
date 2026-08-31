@@ -552,6 +552,13 @@ export interface AutobiographicalConfig {
    *   when they aren't (e.g. before the first compile or after a store reset).
    */
   compressionMode?: 'inline' | 'separate';
+
+  /**
+   * Maximum summary level. When merges at this level would produce level+1,
+   * they produce a same-level entry instead (merge-in-place). The hierarchy
+   * never grows deeper than this. Default 3.
+   */
+  maxMergeLevel?: number;
   /**
    * Hard cap on `max_tokens` for compression requests. The summarizer asks for
    * `max(16000, targetChunkTokens * 1.5)` so folds are not truncated mid-memory,

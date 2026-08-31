@@ -1,0 +1,30 @@
+{
+  "lockfileVersion": 1,
+  "configVersion": 0,
+  "workspaces": {
+    "": {
+      "name": "@animalabs/context-manager",
+      "dependencies": {
+        "@animalabs/chronicle": "^0.3.0",
+        "@animalabs/membrane": "^0.5.69",
+      },
+      "devDependencies": {
+        "@types/node": "^22.0.0",
+        "typescript": "^5.7.0",
+      },
+    },
+  },
+  "packages": {
+    "@animalabs/chronicle": ["@animalabs/chronicle@0.3.0", "", {}, "sha512-6BBJ9pWb8AnuHTNJTU07Y6Wut3IvdgWFxsy05IdlWcEnR5W23dlaBlaeJq7gDc7TwX05HfsDC+QZFEc69G+s4Q=="],
+
+    "@animalabs/membrane": ["@animalabs/membrane@0.5.69", "", { "dependencies": { "@anthropic-ai/sdk": "^0.52.0" } }, "sha512-IjoL130eBlh2EsI16jjQesLKuEsFTTdh97FiDFix5FpMEKp+dJu6nH8ukrewjGid9wSspHNmyNnmgZf4AjKPzg=="],
+
+    "@anthropic-ai/sdk": ["@anthropic-ai/sdk@0.52.0", "", { "bin": { "anthropic-ai-sdk": "bin/cli" } }, "sha512-d4c+fg+xy9e46c8+YnrrgIQR45CZlAi7PwdzIfDXDM6ACxEZli1/fxhURsq30ZpMZy6LvSkr41jGq5aF5TD7rQ=="],
+
+    "@types/node": ["@types/node@22.19.15", "", { "dependencies": { "undici-types": "~6.21.0" } }, "sha512-F0R/h2+dsy5wJAUe3tAU6oqa2qbWY5TpNfL/RGmo1y38hiyO1w3x2jPtt76wmuaJI4DQnOBu21cNXQ2STIUUWg=="],
+
+    "typescript": ["typescript@5.9.3", "", { "bin": { "tsc": "bin/tsc", "tsserver": "bin/tsserver" } }, "sha512-jl1vZzPDinLr9eUt3J/t7V6FgNEw9QjvBPdysz9KfQDD41fQrC2Y4vKQdiaUpFT4bXlb1RHhLpp8wtm6M5TgSw=="],
+
+    "undici-types": ["undici-types@6.21.0", "", {}, "sha512-iwDZqg0QAGrg9Rav5H4n0M64c3mkR59cJ6wQp+7C4nI0gsmExaedaYLNO44eT4AtBBwjbTiGPMlt2Md0T9H9JQ=="],
+  }
+}
