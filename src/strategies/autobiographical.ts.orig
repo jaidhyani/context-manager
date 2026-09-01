@@ -664,52 +664,6 @@ function stripEmptyTextBlocks(content: ContentBlock[]): ContentBlock[] {
 }
 
 /**
- * Prompt-cache breakpoint for COMPRESSION requests (local patch, 2026-08-22).
- *
- * A summarizer prompt re-sends the tools, the head and the whole recall
- * frontier around a ~4k chunk, and until now carried no cache_control at all —
- * ~50k of byte-identical prefix re-billed at full price on every one of the
- * 30–120 compression calls a day (Saga/Aesop, Team seat exhausted 2026-08-22).
- * The live compile already caches its prefix; this gives the summarizer the
- * same treatment: a marker after the head (tools+head never change) and one
- * after the recall frontier (append-mostly, so the previous call's boundary is
- * within Anthropic's 20-block lookback).
- *
- * Block-level, not message-level: the message-level `cacheBreakpoint` flag does
- * not survive splitMixedToolMessages / collapseConsecutiveMessages /
- * stripUnpairedToolBlocks, which all rebuild {participant, content}; content
- * blocks ride through those by reference and membrane's native formatter
- * preserves `cache_control` on text blocks. The marked block is CLONED so the
- * store's own block object is never mutated — a marker leaking into the live
- * compile could push a 4-marker turn past the API's hard cap.
- */
-function withCompressionCacheBreakpoint(
-  content: ContentBlock[],
-  ttl: '5m' | '1h',
-): ContentBlock[] {
-  for (let k = content.length - 1; k >= 0; k--) {
-    const b = content[k] as { type: string; text?: unknown };
-    if (b.type === 'text' && typeof b.text === 'string' && b.text.trim().length > 0) {
-      const out = content.slice();
-      out[k] = { ...(content[k] as object), cache_control: { type: 'ephemeral', ttl } } as ContentBlock;
-      return out;
-    }
-  }
-  return content;
-}
-
-/** Mark the LAST message of `msgs` (in place on the array, cloned block) — see
- *  withCompressionCacheBreakpoint. No-op on an empty array. */
-function markLastForCompressionCache(
-  msgs: Array<{ participant: string; content: ContentBlock[] }>,
-  ttl: '5m' | '1h',
-): void {
-  if (msgs.length === 0) return;
-  const last = msgs[msgs.length - 1];
-  msgs[msgs.length - 1] = { participant: last.participant, content: withCompressionCacheBreakpoint(last.content, ttl) };
-}
-
-/**
  * Strip `thinking` / `redacted_thinking` blocks from RAW messages entering
  * compression input.
  *
@@ -4629,9 +4583,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
       llmMessages.push({ participant: m.participant, content: stripThinkingBlocks(m.content) });
     }
-    // Cache breakpoint #1: tools + head (local patch 2026-08-22, see withCompressionCacheBreakpoint).
-    const compressionCacheTtl = this.config.compressionCacheTtl ?? '1h';
-    markLastForCompressionCache(llmMessages, compressionCacheTtl);
     if (headCoveredSkipped > 0) {
       console.warn(
         `autobio: ${headCoveredSkipped} head-window message(s) are covered by live summaries; ` +
@@ -4691,8 +4642,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         content: this.summaryAnswerContent(s),
       });
     }
-    // Cache breakpoint #2: end of the recall frontier (append-mostly between calls).
-    if (keptSummaries.length > 0) markLastForCompressionCache(llmMessages, compressionCacheTtl);
 
     // ---- 3. Raw middle ----
     // Any raw messages between the head and the chunk that aren't yet
@@ -5702,9 +5651,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
       llmMessages.push({ participant: m.participant, content: stripThinkingBlocks(m.content) });
     }
-    // Cache breakpoint #1: tools + head (local patch 2026-08-22, see withCompressionCacheBreakpoint).
-    const compressionCacheTtl = this.config.compressionCacheTtl ?? '1h';
-    markLastForCompressionCache(llmMessages, compressionCacheTtl);
     if (headCoveredSkipped > 0) {
       console.warn(
         `autobio: ${headCoveredSkipped} head-window message(s) are covered by live summaries or ` +
@@ -5780,8 +5726,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         content: this.summaryAnswerContent(s),
       });
     }
-    // Cache breakpoint #2: end of the prior recall frontier.
-    if (keptPriorSummaries.length > 0) markLastForCompressionCache(llmMessages, compressionCacheTtl);
 
     // Raw middle: any messages between the head window and the merge
     // range that aren't covered by a prior summary or the merge tree.

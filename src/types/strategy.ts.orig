@@ -829,13 +829,6 @@ export interface AutobiographicalConfig {
   compressionSlackRatio?: number;
 
   /**
-   * Prompt-cache TTL for the breakpoints placed in COMPRESSION (summarizer /
-   * merge) requests — after the head and after the recall frontier. Local
-   * patch 2026-08-22; default '1h' to match the live compile's cacheTtl.
-   */
-  compressionCacheTtl?: '5m' | '1h';
-
-  /**
    * Enable bottom-up speculative pre-production of higher-level summaries.
    * When a new L_k summary is produced, if N siblings exist that would share
    * an L_{k+1} parent, the L_{k+1} is enqueued for production immediately

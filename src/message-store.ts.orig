@@ -779,18 +779,6 @@ export class MessageStore {
         if (hasSignature && (!block.thinking || block.thinking.length === 0)) {
           return MessageStore.HIDDEN_THINKING_TOKENS_DEFAULT;
         }
-        // Signed block WITH text (display:"summarized"): the text is a
-        // summary, not the CoT — on replay the API ignores it and bills the
-        // full reasoning decrypted from the signature, exactly as for an
-        // empty block. Never price a signed block below the hidden-CoT
-        // default just because a shorter summary came back; a summary longer
-        // than the default is a (monotone) hint that the CoT was too.
-        if (hasSignature) {
-          return Math.max(
-            MessageStore.HIDDEN_THINKING_TOKENS_DEFAULT,
-            this.tokenEstimator(block.thinking)
-          );
-        }
         return this.tokenEstimator(block.thinking);
       }
       case 'redacted_thinking': {
